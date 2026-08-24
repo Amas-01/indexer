@@ -40,7 +40,7 @@ func (f fakeDomains) GetDomainEvents(ctx context.Context, name string, limit int
 }
 
 func TestDomainsAPINotIndexedYet(t *testing.T) {
-	srv := New("127.0.0.1:0", fakePinger{})
+	srv := New("127.0.0.1:0", Options{DB: fakePinger{}})
 
 	paths := []string{
 		"/v1/domains",
@@ -77,7 +77,7 @@ func TestDomainsAPIResolveAndReverseLookup(t *testing.T) {
 		Status:          store.DomainStatusActive,
 		LastEventLedger: 42,
 	}
-	srv := New("127.0.0.1:0", fakePinger{})
+	srv := New("127.0.0.1:0", Options{DB: fakePinger{}})
 	srv.SetDomainReader(fakeDomains{
 		indexed: true,
 		byName:  map[string]*store.Domain{"stellar.xlm": &d},
@@ -130,7 +130,7 @@ func TestDomainsAPIResolveAndReverseLookup(t *testing.T) {
 }
 
 func TestDomainsAPIMissingNameStillIndexed(t *testing.T) {
-	srv := New("127.0.0.1:0", fakePinger{})
+	srv := New("127.0.0.1:0", Options{DB: fakePinger{}})
 	srv.SetDomainReader(fakeDomains{indexed: true, byName: map[string]*store.Domain{}})
 
 	rec := httptest.NewRecorder()
