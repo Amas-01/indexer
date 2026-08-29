@@ -31,15 +31,36 @@ make build
 | `DATABASE_URL` | `postgresql://explorer:explorer_dev@localhost:54320/stellar_explorer?sslmode=disable` | No       | PostgreSQL connection. Change `sslmode=disable` to `sslmode=require` in production. |
 | `REDIS_URL`    | `redis://localhost:63790`                                                             | No       | Redis connection (optional — logs warning if unavailable) |
 | `BATCH_SIZE`   | `100`                                                                                 | No       | Ledgers per batch                                         |
-| `WORKER_COUNT` | `8`                                                                                   | No       | Parallel workers for `backfill` and `s3backfill`          |
-| `METRICS_ADDR` | —                                                                                     | No       | Listen address (e.g. `:9090`) for `/metrics` and `/healthz` during `live` ingestion. Disabled when unset. |
+| `WORKER_COUNT` | `8`                                                                                   | No       | Parallel workers for `backfill` / `s3backfill`, and for live contract-spec processing |
+| `METRICS_ADDR` | —                                                                                     | No       | Listen address (e.g. `:9090`) for `/metrics`, `/healthz`, and `/v1/domains` during `live` ingestion. Disabled when unset. Also serves the domains read API when `HTTP_ADDR` is unset. |
+| `HTTP_ADDR`    | —                                                                                     | No       | Listen address for the domains read API (and `/metrics` `/healthz`). Overrides `METRICS_ADDR` when both are set. |
+| `DOMAINS_REGISTRY_CONTRACT_ID` | pubnet default (see below) | No | Comma-separated Soroban Domains registry contract ID(s). Required on testnet/futurenet. |
+| `API_ADDR`     | `:8080`                                                                               | No       | Listen address for the read API served by `serve`.        |
+| `API_CORS_ORIGINS` | `*`                                                                               | No       | Comma-separated CORS allow-list for the read API. Empty refuses cross-origin requests. |
+
+### Listeners
+
+The listen addresses serve different processes and should be treated differently:
+
+| Address | Process | Serves | Exposure |
+| ------- | ------- | ------ | -------- |
+| `METRICS_ADDR` / `HTTP_ADDR` | `live` | `/metrics`, `/healthz`, `/v1/domains` | `/metrics` is internal telemetry; `/v1/domains` is public if the explorer is public. Set `HTTP_ADDR` to a separate, public-facing address to split them from `METRICS_ADDR`. |
+| `API_ADDR` | `serve` | `/api/v1/analytics/*` and `/healthz` | Public, if the explorer is public. |
+
+`serve` exposes `/healthz` so an orchestrator can probe it, but not `/metrics`: the registry holds
+ingestion counters, and publishing them from a process that never ingests reports every one as zero,
+dragging down any average or minimum an alert is built on. The analytics API is likewise never
+mounted on `live`.
 
 ### Observability
 
-When `METRICS_ADDR` is set, `live` starts an HTTP server alongside ingestion:
+When `METRICS_ADDR` or `HTTP_ADDR` is set, `live` starts an HTTP server alongside ingestion:
 
 - `GET /metrics` -- Prometheus exposition format. Exposes `indexer_ledgers_ingested_total`, `indexer_transactions_ingested_total`, `indexer_operations_ingested_total`, `indexer_rpc_errors_total`, `indexer_db_errors_total`, and the `indexer_ingestion_lag_ledgers` gauge (network tip minus last ingested ledger).
 - `GET /healthz` -- liveness/readiness probe. Returns `200` when the database is reachable and the ingestion loop has completed a poll cycle within the last 2 minutes, `503` otherwise (with a generic `reason`, never the raw database error). Suitable for Docker/k8s health checks.
+- `GET /v1/domains` -- Soroban Domains read API (resolve by name, reverse lookup, list, event history). Response shape is frozen in [docs/domains-api.md](docs/domains-api.md). `indexed: false` means ingestion has not started yet — not an error.
+
+On pubnet the indexer watches registry contract `CC75Z72OCE667WVPQOROIWDAGBOXFNJ4VQONQEURL74EYIDLWA4F7FEN` unless `DOMAINS_REGISTRY_CONTRACT_ID` is set. Testnet and futurenet have no default; set the env var to enable domain ingestion.
 
 ## Commands
 
@@ -47,6 +68,7 @@ When `METRICS_ADDR` is set, `live` starts an HTTP server alongside ingestion:
 make build          # Compile to bin/indexer
 make migrate        # Apply pending database migrations
 make run-live       # Live ingestion (requires RPC_ENDPOINT env var)
+make run-serve      # Analytics read API (no ingestion)
 make test           # Run all tests
 make fmt            # Format code
 make lint           # Run go vet
@@ -105,6 +127,34 @@ Key details:
 WORKER_COUNT=16 ./bin/indexer s3backfill --start 3 --end 5000000
 ```
 
+## Network analytics
+
+Network-wide time series (transaction volume, fees, account activity, asset supply) and Top-N
+rankings are served over HTTP from TimescaleDB continuous aggregates:
+
+```bash
+API_ADDR=:8080 ./bin/indexer serve
+
+curl 'localhost:8080/api/v1/analytics/timeseries?metric=tx_count&resolution=hourly&from=2026-08-20T19:00:00Z&to=2026-08-20T23:00:00Z'
+curl 'localhost:8080/api/v1/analytics/top?metric=contract_activity&window=24h&limit=10'
+```
+
+`serve` runs the read API as its own process. It is not mounted on `live`, which would put dashboard
+queries on the ingestion connection pool.
+
+The aggregates are created empty by the migration, so populate them once from existing history:
+
+```bash
+./bin/indexer analytics-backfill                              # everything already ingested
+./bin/indexer analytics-backfill --from 2026-01-01T00:00:00Z  # from a point in time
+```
+
+Run it again after any `backfill` or `s3backfill`: those write history below the aggregates'
+watermark, which no refresh policy reaches.
+
+Metric definitions, response shapes, and the aggregation layout are documented in
+[`docs/analytics-api.md`](docs/analytics-api.md).
+
 ## Migrations
 
 Migrations live in `migrations/` and are embedded in the binary at build time.
@@ -153,9 +203,13 @@ To wipe all ingested data and start fresh (useful after testing with different n
 ```bash
 docker compose -f infra/docker-compose.yml exec postgres psql -U explorer -d stellar_explorer -c "
   TRUNCATE ledgers, transactions, operations, effects, accounts, contracts,
-    contract_events, token_events, assets, trades, network_stats, ingestion_state CASCADE;
+    contract_events, token_events, assets, trades, network_stats, ingestion_state,
+    domains, domain_events CASCADE;
 "
 ```
+
+Truncating does not empty the analytics aggregates — their materialized data and watermarks survive.
+Re-apply migration `000014` (down, then up) to reset them as well.
 
 To reset only the ingestion cursor (keeps existing data but allows re-ingestion):
 
@@ -229,10 +283,11 @@ AWS S3 ─────> source/datalake.go ─────────┘       
 
 | Package              | Purpose                                                                 |
 | -------------------- | ----------------------------------------------------------------------- |
-| `cmd/indexer`        | Entry point with `live`, `backfill`, `migrate` commands                 |
+| `cmd/indexer`        | Entry point with `live`, `backfill`, `serve`, `analytics-backfill`, `migrate` commands |
 | `internal/config`    | Environment variable loading and validation                             |
 | `internal/source`    | Stellar RPC client (`getLedgers`, `getTransactions`, `getLatestLedger`) |
 | `internal/transform` | XDR parsing into database models (ledgers, transactions, operations)    |
 | `internal/store`     | PostgreSQL writer with batch inserts and ingestion cursor               |
 | `internal/pipeline`  | Live ingestion loop and parallel backfill orchestration                 |
 | `internal/publisher` | Redis pub/sub for real-time event streaming                             |
+| `internal/analytics` | Network analytics read API: contract, validation, and HTTP handlers     |

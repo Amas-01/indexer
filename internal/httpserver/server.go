@@ -1,6 +1,6 @@
-// Package httpserver provides an opt-in HTTP server exposing Prometheus
-// metrics and a liveness/readiness health check for the running indexer
-// process, so it can be monitored and probed by Docker/k8s.
+// Package httpserver provides the indexer's HTTP surface: Prometheus metrics
+// and a liveness/readiness health check for the running process, plus the
+// analytics read API when a data source is supplied.
 package httpserver
 
 import (
@@ -12,6 +12,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/miguelnietoa/stellar-explorer/indexer/internal/analytics"
 	"github.com/miguelnietoa/stellar-explorer/indexer/internal/health"
 	"github.com/miguelnietoa/stellar-explorer/indexer/internal/metrics"
 )
@@ -19,6 +20,22 @@ import (
 // pingTimeout bounds how long /healthz waits on the database before
 // reporting unhealthy, so a stuck connection can't hang the probe.
 const pingTimeout = 2 * time.Second
+
+// readHeaderTimeout bounds how long a client may take to send its request
+// headers, so a stalled or malicious connection cannot hold a worker open
+// indefinitely once this server is exposed as a public read API.
+const readHeaderTimeout = 10 * time.Second
+
+// writeTimeout caps how long a single response may take, so one pathological
+// analytics query cannot hold a connection indefinitely. idleTimeout reclaims
+// keep-alive connections that have gone quiet.
+// writeTimeout must stay below the caller's shutdown grace, so a request
+// started just before SIGTERM cannot outlive the drain and have the database
+// pool closed underneath it.
+const (
+	writeTimeout = 15 * time.Second
+	idleTimeout  = 120 * time.Second
+)
 
 // pipelineStaleAfter is how long the ingestion loop can go without
 // completing a poll cycle before /healthz reports it as not advancing.
@@ -37,25 +54,61 @@ type dbPinger interface {
 // simulate a stuck pipeline without depending on real elapsed time.
 type staleChecker func(maxAge time.Duration) bool
 
-// Server serves /metrics and /healthz for a running indexer process.
+// Server serves /metrics, /healthz, and the domains read API.
 type Server struct {
-	srv *http.Server
+	srv     *http.Server
+	domains DomainReader
 }
 
-// New builds a Server listening on addr. db is used by /healthz to verify
-// the database is reachable and confirm the live pipeline is still
-// advancing.
-func New(addr string, db dbPinger) *Server {
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
-	mux.HandleFunc("/healthz", healthzHandler(db, health.Stale))
+// Options configures what a Server exposes. /healthz and the domains read API
+// are always mounted, since every process wants a probe and domain lookups
+// degrade gracefully (indexed=false) when no reader is attached.
+type Options struct {
+	// DB backs /healthz, verifying the database is reachable and that the live
+	// pipeline is still advancing.
+	DB dbPinger
+	// Analytics supplies the read API. Nil leaves those routes unmounted, which
+	// is what a process that ingests but should not serve queries wants.
+	Analytics analytics.Reader
+	// AllowedOrigins is the CORS allow-list for the analytics routes.
+	AllowedOrigins []string
+	// ExposeMetrics mounts /metrics. It belongs on the ingesting process: the
+	// registry holds ingestion counters, and publishing them from a process
+	// that does not ingest reports every one of them as zero, which drags down
+	// any average or minimum an alert is built on.
+	ExposeMetrics bool
+}
 
-	return &Server{
-		srv: &http.Server{
-			Addr:    addr,
-			Handler: mux,
-		},
+// New builds a Server listening on addr with the given options.
+func New(addr string, opts Options) *Server {
+	s := &Server{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", healthzHandler(opts.DB, health.Stale))
+
+	if opts.ExposeMetrics {
+		mux.Handle("/metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
 	}
+	if opts.Analytics != nil {
+		analytics.NewHandler(opts.Analytics, opts.AllowedOrigins).Register(mux)
+	}
+	mux.HandleFunc("GET /v1/domains/{name}/events", s.handleDomainEvents)
+	mux.HandleFunc("GET /v1/domains/{name}", s.handleDomainByName)
+	mux.HandleFunc("GET /v1/domains", s.handleDomains)
+
+	s.srv = &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: readHeaderTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+	}
+	return s
+}
+
+// SetDomainReader attaches the domains store used by the read API. When unset,
+// domain endpoints return HTTP 200 with indexed=false.
+func (s *Server) SetDomainReader(r DomainReader) {
+	s.domains = r
 }
 
 // Start blocks serving requests until the server is shut down. It returns
